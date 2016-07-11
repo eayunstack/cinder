@@ -13,6 +13,7 @@
 #    under the License.
 #
 
+import socket
 
 from cinder import context
 from cinder import db
@@ -136,3 +137,31 @@ def create_cgsnapshot(ctxt,
     for key in kwargs:
         cgsnap[key] = kwargs[key]
     return db.cgsnapshot_create(ctxt, cgsnap)
+
+
+def create_backup(ctxt,
+                  volume_id,
+                  display_name='test_backup',
+                  display_description='This is a test backup',
+                  status='creating',
+                  parent_id=None,
+                  temp_volume_id=None,
+                  temp_snapshot_id=None):
+    backup = {}
+    backup['volume_id'] = volume_id
+    backup['user_id'] = ctxt.user_id
+    backup['project_id'] = ctxt.project_id
+    backup['host'] = socket.gethostname()
+    backup['availability_zone'] = '1'
+    backup['display_name'] = display_name
+    backup['display_description'] = display_description
+    backup['container'] = 'fake'
+    backup['status'] = status
+    backup['fail_reason'] = ''
+    backup['service'] = 'fake'
+    backup['parent_id'] = parent_id
+    backup['size'] = 5 * 1024 * 1024
+    backup['object_count'] = 22
+    backup['temp_volume_id'] = temp_volume_id
+    backup['temp_snapshot_id'] = temp_snapshot_id
+    return db.backup_create(ctxt, backup)

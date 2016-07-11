@@ -17,6 +17,7 @@
 import datetime
 
 from oslo.config import cfg
+import six
 
 from cinder import context
 from cinder import db
@@ -71,8 +72,9 @@ class ModelsObjectComparatorMixin(object):
 
         self.assertEqual(
             len(obj1), len(obj2),
-            "Keys mismatch: %s" % str(set(obj1.keys()) ^ set(obj2.keys())))
-        for key, value in obj1.iteritems():
+            "Keys mismatch: %s" % six.text_type(
+                set(obj1.keys()) ^ set(obj2.keys())))
+        for key, value in obj1.items():
             self.assertEqual(value, obj2[key])
 
     def _assertEqualListsOfObjects(self, objs1, objs2, ignored_keys=None):
@@ -1205,7 +1207,9 @@ class DBAPIBackupTestCase(BaseTest):
             'service_metadata': 'metadata',
             'service': 'service',
             'size': 1000,
-            'object_count': 100}
+            'object_count': 100,
+            'temp_volume_id': 'temp_volume_id',
+            'temp_snapshot_id': 'temp_snapshot_id', }
         if one:
             return base_values
 

@@ -496,6 +496,19 @@ class BaseVD(object):
         LOG.debug(('Creating a new backup for volume %s.') %
                   volume['name'])
 
+        # NOTE(xyang): Check volume status; if not 'available', create a
+        # a temp volume from the volume, and backup the temp volume, and
+        # then clean up the temp volume; if 'available', just backup the
+        # volume.
+        previous_status = volume.get('previous_status', None)
+        temp_vol_ref = None
+        if previous_status == "in_use":
+            temp_vol_ref = self._create_temp_cloned_volume(
+                context, volume)
+            backup['temp_volume_id'] = temp_vol_ref['id']
+            self.db.backup_update(context, backup['id'], backup)
+            volume = temp_vol_ref
+
         properties = utils.brick_get_connector_properties()
         attach_info = self._attach_volume(context, volume, properties)
 
@@ -507,6 +520,10 @@ class BaseVD(object):
 
         finally:
             self._detach_volume(context, attach_info, volume, properties)
+            if temp_vol_ref:
+                self._delete_volume(context, temp_vol_ref)
+                backup['temp_volume_id'] = None
+                self.db.backup_update(context, backup['id'], backup)
 
     def restore_backup(self, context, backup, volume, backup_service):
         """Restore an existing backup to a new or existing volume."""
@@ -526,6 +543,64 @@ class BaseVD(object):
 
         finally:
             self._detach_volume(context, attach_info, volume, properties)
+
+    def _create_temp_snapshot(self, context, volume):
+        options = {
+            'volume_id': volume['id'],
+            'cgsnapshot_id': None,
+            'user_id': context.user_id,
+            'project_id': context.project_id,
+            'status': 'creating',
+            'progress': '0%',
+            'volume_size': volume['size'],
+            'display_name': 'backup-snap-%s' % volume['id'],
+            'display_description': None,
+            'volume_type_id': volume['volume_type_id'],
+            'encryption_key_id': volume['encryption_key_id'],
+            'metadata': {},
+        }
+        temp_snap_ref = self.db.snapshot_create(context, options)
+        try:
+            self.create_snapshot(temp_snap_ref)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self.db.volume_glance_metadata_delete_by_snapshot(
+                        context, temp_snap_ref['id'])
+                self.db.snapshot_destroy(temp_snap_ref['id'])
+
+        temp_snap_ref['status'] = 'available'
+        self.db.snapshot_update(context, temp_snap_ref['id'], temp_snap_ref)
+        return temp_snap_ref
+
+    def _create_temp_cloned_volume(self, context, volume):
+        temp_volume = {
+            'size': volume['size'],
+            'display_name': 'backup-vol-%s' % volume['id'],
+            'host': volume['host'],
+            'user_id': context.user_id,
+            'project_id': context.project_id,
+            'status': 'creating',
+        }
+        temp_vol_ref = self.db.volume_create(context, temp_volume)
+        try:
+            self.create_cloned_volume(temp_vol_ref, volume)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self.db.volume_destroy(context, temp_vol_ref['id'])
+
+        self.db.volume_update(context, temp_vol_ref['id'],
+                              {'status': 'available'})
+        return temp_vol_ref
+
+    def _delete_snapshot(self, context, snapshot):
+        self.delete_snapshot(snapshot)
+        self.db.volume_glance_metadata_delete_by_snapshot(
+                context, snapshot['id'])
+        self.db.snapshot_destroy(context, snapshot['id'])
+
+    def _delete_volume(self, context, volume):
+        self.delete_volume(volume)
+        self.db.volume_destroy(context, volume['id'])
 
     def clear_download(self, context, volume):
         """Clean up after an interrupted image copy."""

@@ -246,7 +246,7 @@ class BackupsController(wsgi.Controller):
         container = backup.get('container', None)
         name = backup.get('name', None)
         description = backup.get('description', None)
-
+        force = backup.get('force', False)
         LOG.info(_("Creating backup of volume %(volume_id)s in container"
                    " %(container)s"),
                  {'volume_id': volume_id, 'container': container},
@@ -254,7 +254,8 @@ class BackupsController(wsgi.Controller):
 
         try:
             new_backup = self.backup_api.create(context, name, description,
-                                                volume_id, container)
+                                                volume_id, container,
+                                                None, force)
         except exception.InvalidVolume as error:
             raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.VolumeNotFound as error:

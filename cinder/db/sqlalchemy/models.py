@@ -158,6 +158,8 @@ class Volume(BASE, CinderBase):
     replication_extended_status = Column(String(255))
     replication_driver_data = Column(String(255))
 
+    previous_status = Column(String(255))
+
     consistencygroup = relationship(
         ConsistencyGroup,
         backref="volumes",
@@ -516,6 +518,8 @@ class Backup(BASE, CinderBase):
     service = Column(String(255))
     size = Column(Integer)
     object_count = Column(Integer)
+    temp_volume_id = Column(String(36))
+    temp_snapshot_id = Column(String(36))
 
     @validates('fail_reason')
     def validate_fail_reason(self, key, fail_reason):

@@ -73,7 +73,7 @@ QUOTAS = quota.QUOTAS
 class BackupManager(manager.SchedulerDependentManager):
     """Manages backup of block storage devices."""
 
-    RPC_API_VERSION = '1.0'
+    RPC_API_VERSION = '1.2'
 
     target = messaging.Target(version=RPC_API_VERSION)
 
@@ -193,61 +193,156 @@ class BackupManager(manager.SchedulerDependentManager):
         for mgr in self.volume_managers.itervalues():
             self._init_volume_driver(ctxt, mgr.driver)
 
-        LOG.info(_("Cleaning up incomplete backup operations."))
+        try:
+            self._cleanup_incomplete_backup_operations(ctxt)
+        except Exception:
+            # Don't block startup of the backup service.
+            LOG.exception(_LE("Problem cleaning incomplete backup "
+                              "operations."))
+
+    def _cleanup_incomplete_backup_operations(self, ctxt):
+        LOG.info(_LI("Cleaning up incomplete backup operations."))
         volumes = self.db.volume_get_all_by_host(ctxt, self.host)
+
         for volume in volumes:
-            volume_host = volume_utils.extract_host(volume['host'], 'backend')
-            backend = self._get_volume_backend(host=volume_host)
-            attachments = volume['volume_attachment']
-            if attachments:
-                if volume['status'] == 'backing-up':
-                    LOG.info(_LI('Resetting volume %s to available '
-                                 '(was backing-up).'), volume['id'])
-                    mgr = self._get_manager(backend)
-                    for attachment in attachments:
-                        if (attachment['attached_host'] == self.host and
-                           attachment['instance_uuid'] is None):
-                            mgr.detach_volume(ctxt, volume['id'],
-                                              attachment['id'])
-                if volume['status'] == 'restoring-backup':
-                    LOG.info(_LI('setting volume %s to error_restoring '
-                                 '(was restoring-backup).'), volume['id'])
-                    mgr = self._get_manager(backend)
-                    for attachment in attachments:
-                        if (attachment['attached_host'] == self.host and
-                           attachment['instance_uuid'] is None):
-                            mgr.detach_volume(ctxt, volume['id'],
-                                              attachment['id'])
-                    self.db.volume_update(ctxt, volume['id'],
-                                          {'status': 'error_restoring'})
+            try:
+                self._cleanup_one_volume(ctxt, volume)
+            except Exception:
+                LOG.exception(_LE("Problem cleaning up volume %(vol)s."),
+                              {'vol': volume['id']})
 
         # TODO(smulcahy) implement full resume of backup and restore
         # operations on restart (rather than simply resetting)
         backups = self.db.backup_get_all_by_host(ctxt, self.host)
         for backup in backups:
-            if backup['status'] == 'creating':
-                LOG.info(_('Resetting backup %s to error (was creating).')
-                         % backup['id'])
-                err = 'incomplete backup reset on manager restart'
-                self.db.backup_update(ctxt, backup['id'], {'status': 'error',
-                                                           'fail_reason': err})
-            if backup['status'] == 'restoring':
-                LOG.info(_('Resetting backup %s to available (was restoring).')
-                         % backup['id'])
-                self.db.backup_update(ctxt, backup['id'],
-                                      {'status': 'available'})
-            if backup['status'] == 'deleting':
-                LOG.info(_('Resuming delete on backup: %s.') % backup['id'])
-                self.delete_backup(ctxt, backup['id'])
+            try:
+                self._cleanup_one_backup(ctxt, backup)
+            except Exception:
+                LOG.exception(_LE("Problem cleaning up backup %(bkup)s."),
+                              {'bkup': backup['id']})
+            try:
+                self._cleanup_temp_volumes_snapshots_for_one_backup(ctxt,
+                                                                    backup)
+            except Exception:
+                LOG.exception(_LE("Problem cleaning temp volumes and "
+                                  "snapshots for backup %(bkup)s."),
+                              {'bkup': backup['id']})
+
+    def _cleanup_one_volume(self, ctxt, volume):
+        volume_host = volume_utils.extract_host(volume['host'], 'backend')
+        backend = self._get_volume_backend(host=volume_host)
+        mgr = self._get_manager(backend)
+        if volume['status'] == 'backing-up':
+            self._detach_all_attachments(ctxt, mgr, volume)
+            LOG.info(_LI('Resetting volume %(vol_id)s to previous '
+                         'status %(status)s (was backing-up).'),
+                     {'vol_id': volume['id'],
+                      'status': volume['previous_status']})
+            self.db.volume_update(ctxt, volume['id'],
+                                  {'status': volume['previous_status']})
+        elif volume['status'] == 'restoring-backup':
+            self._detach_all_attachments(ctxt, mgr, volume)
+            LOG.info(_LI('setting volume %s to error_restoring '
+                         '(was restoring-backup).'), volume['id'])
+            self.db.volume_update(ctxt, volume['id'],
+                                  {'status': 'error_restoring'})
+
+    def _cleanup_one_backup(self, ctxt, backup):
+        if backup['status'] == 'creating':
+            LOG.info(_LI('Resetting backup %s to error (was creating).'),
+                     backup['id'])
+            err = 'incomplete backup reset on manager restart'
+            backup['status'] = 'error'
+            backup['fail_reason'] = err
+            self.db.backup_update(ctxt, backup['id'], {'status': 'error',
+                                                       'fail_reason': err})
+        if backup['status'] == 'restoring':
+            LOG.info(_LI('Resetting backup %s to '
+                         'available (was restoring).'),
+                     backup['id'])
+            backup['status'] = 'available'
+            self.db.backup_update(ctxt, backup['id'],
+                                  {'status': 'available'})
+        if backup['status'] == 'deleting':
+            LOG.info(_LI('Resuming delete on backup: %s.'), backup['id'])
+            self.delete_backup(ctxt, backup['id'])
+
+    def _detach_all_attachments(self, ctxt, mgr, volume):
+        attachments = volume['volume_attachment'] or []
+        for attachment in attachments:
+            if (attachment['attached_host'] == self.host and
+                    attachment['instance_uuid'] is None):
+                        try:
+                            mgr.detach_volume(ctxt, volume['id'],
+                                              attachment['id'])
+                        except Exception:
+                            LOG.exception(_LE("Detach attachment %(attach_id)s"
+                                              " failed."),
+                                          {'attach_id': attachment['id']},
+                                          resource=volume)
+
+    def _cleanup_temp_volumes_snapshots_for_one_backup(self, ctxt, backup):
+        # NOTE(xyang): If the service crashes or gets restarted during the
+        # backup operation, there could be temporary volumes or snapshots
+        # that are not deleted. Make sure any temporary volumes or snapshots
+        # create by the backup job are deleted when service is started.
+        try:
+            volume = self.db.volume_get(ctxt, backup.volume_id)
+            volume_host = volume_utils.extract_host(volume['host'],
+                                                    'backend')
+            backend = self._get_volume_backend(host=volume_host)
+            mgr = self._get_manager(backend)
+        except (KeyError, exception.VolumeNotFound):
+            LOG.debug("Could not find a volume to clean up for "
+                      "backup %s.", backup.id)
+            return
+
+        if backup['temp_volume_id'] and backup['status'] == 'error':
+            try:
+                temp_volume = self.db.volume_get(ctxt,
+                                                 backup.temp_volume_id)
+                # The temp volume should be deleted directly thru the
+                # the volume driver, not thru the volume manager.
+                mgr.driver.delete_volume(temp_volume)
+                self.db.volume_destroy(ctxt, temp_volume['id'])
+            except exception.VolumeNotFound:
+                LOG.debug("Could not find temp volume %(vol)s to clean up "
+                          "for backup %(backup)s.",
+                          {'vol': backup.temp_volume_id,
+                           'backup': backup.id})
+            backup['temp_volume_id'] = None
+            self.db.backup_update(ctxt, backup['id'],
+                                  {'temp_volume_id': None})
+
+        if backup['temp_snapshot_id'] and backup['status'] == 'error':
+            try:
+                temp_snapshot = self.db.snapshot_get(
+                        ctxt, backup['temp_snapshot_id'])
+                # The temp snapshot should be deleted directly thru the
+                # volume driver, not thru the volume manager.
+                mgr.driver.delete_snapshot(temp_snapshot)
+                self.db.volume_glance_metadata_delete_by_snapshot(
+                        ctxt, temp_snapshot['id'])
+                self.db.snapshot_destroy(ctxt, temp_snapshot['id'])
+            except exception.SnapshotNotFound:
+                LOG.debug("Could not find temp snapshot %(snap)s to clean "
+                          "up for backup %(backup)s.",
+                          {'snap': backup['temp_snapshot_id'],
+                           'backup': backup['id']})
+            backup['temp_snapshot_id'] = None
+            self.db.backup_update(ctxt, backup['id'],
+                                  {'temp_snapshot_id': None})
 
     def create_backup(self, context, backup_id):
         """Create volume backups using configured backup service."""
         backup = self.db.backup_get(context, backup_id)
         volume_id = backup['volume_id']
         volume = self.db.volume_get(context, volume_id)
-        LOG.info(_('Create backup started, backup: %(backup_id)s '
-                   'volume: %(volume_id)s.') %
-                 {'backup_id': backup_id, 'volume_id': volume_id})
+        previous_status = volume.get('previous_status', None)
+        LOG.info(_LI('Create backup started, backup: %(backup_id)s '
+                     'volume: %(volume_id)s.'),
+                 {'backup_id': backup['id'], 'volume_id': volume_id})
+
         volume_host = volume_utils.extract_host(volume['host'], 'backend')
         backend = self._get_volume_backend(host=volume_host)
 
@@ -293,12 +388,16 @@ class BackupManager(manager.SchedulerDependentManager):
         except Exception as err:
             with excutils.save_and_reraise_exception():
                 self.db.volume_update(context, volume_id,
-                                      {'status': 'available'})
+                                      {'status': previous_status,
+                                       'previous_status': 'error_backing-up'})
                 self.db.backup_update(context, backup_id,
                                       {'status': 'error',
                                        'fail_reason': unicode(err)})
 
-        self.db.volume_update(context, volume_id, {'status': 'available'})
+        # Restore the original status.
+        self.db.volume_update(context, volume_id,
+                              {'status': previous_status,
+                               'previous_status': 'backing-up'})
         self.db.backup_update(context, backup_id, {'status': 'available',
                                                    'size': volume['size'],
                                                    'availability_zone':

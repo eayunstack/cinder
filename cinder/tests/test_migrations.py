@@ -1305,11 +1305,11 @@ class TestMigrations(test.TestCase):
             migration_api.version_control(engine,
                                           TestMigrations.REPOSITORY,
                                           migration.db_initial_version())
-            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 31)
+            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 26)
             metadata = sqlalchemy.schema.MetaData()
             metadata.bind = engine
 
-            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 32)
+            migration_api.upgrade(engine, TestMigrations.REPOSITORY, 27)
 
             self.assertTrue(engine.dialect.has_table(engine.connect(),
                                                      "volume_type_projects"))
@@ -1338,7 +1338,7 @@ class TestMigrations(test.TestCase):
             self.assertIsInstance(volume_types.c.is_public.type,
                                   self.bool_type[engine.name])
 
-            migration_api.downgrade(engine, TestMigrations.REPOSITORY, 31)
+            migration_api.downgrade(engine, TestMigrations.REPOSITORY, 26)
             metadata = sqlalchemy.schema.MetaData()
             metadata.bind = engine
 
@@ -1383,4 +1383,25 @@ class TestMigrations(test.TestCase):
                               sqlalchemy.types.VARCHAR)
         self.assertIsInstance(volumes.c.mountpoint.type,
                               sqlalchemy.types.VARCHAR)
+
+    def _check_029(self, engine, data):
+        backups = db_utils.get_table(engine, 'backups')
+        self.assertIsInstance(backups.c.temp_volume_id.type,
+                              sqlalchemy.types.VARCHAR)
+        self.assertIsInstance(backups.c.temp_snapshot_id.type,
+                              sqlalchemy.types.VARCHAR)
+
+    def _post_downgrade_029(self, engine):
+        backups = db_utils.get_table(engine, 'backups')
+        self.assertNotIn('temp_volume_id', backups.c)
+        self.assertNotIn('temp_snapshot_id', backups.c)
+
+    def _check_030(self, engine, data):
+        volumes = db_utils.get_table(engine, 'volumes')
+        self.assertIsInstance(volumes.c.previous_status.type,
+                              sqlalchemy.types.VARCHAR)
+
+    def _post_downgrade_030(self, engine):
+        volumes = db_utils.get_table(engine, 'volumes')
+        self.assertNotIn('previous_status', volumes.c)
 
