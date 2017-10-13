@@ -701,7 +701,7 @@ class RBDDriver(driver.VolumeDriver):
             # resize rbd to snap volume size if the snapshot is created
             # before the rbd extended
             if volume['size'] != snapshot['volume_size']:
-                dest_volume.resize(volume['size'])
+                dest_volume.resize(int(volume['size']) * units.Gi)
 
     def create_snapshot(self, snapshot):
         """Creates an rbd snapshot."""
