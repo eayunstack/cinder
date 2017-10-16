@@ -309,7 +309,10 @@ class API(base.Base):
 
         # Setting the status here rather than setting at start and unrolling
         # for each error condition, it should be a very small window
-        self.db.backup_update(context, backup_id, {'status': 'restoring'})
+        self.db.backup_update(context, backup_id, {
+            'status': 'restoring',
+            'restore_volume_id': volume_id
+            })
         self.db.volume_update(context, volume_id, {'status':
                                                    'restoring-backup'})
 

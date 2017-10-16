@@ -1189,7 +1189,8 @@ class DBAPIBackupTestCase(BaseTest):
             'size': 1000,
             'object_count': 100,
             'temp_volume_id': 'temp_volume_id',
-            'temp_snapshot_id': 'temp_snapshot_id', }
+            'temp_snapshot_id': 'temp_snapshot_id',
+            'restore_volume_id': 'restore_volume_id'}
         if one:
             return base_values
 
