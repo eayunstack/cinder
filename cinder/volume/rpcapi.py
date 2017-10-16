@@ -208,7 +208,8 @@ class VolumeAPI(object):
                           error=error)
 
     def retype(self, ctxt, volume, new_type_id, dest_host,
-               migration_policy='never', reservations=None):
+               migration_policy='never', reservations=None,
+               old_reservations=None):
         new_host = utils.extract_host(volume['host'])
         cctxt = self.client.prepare(server=new_host, version='1.12')
         host_p = {'host': dest_host.host,
@@ -216,7 +217,8 @@ class VolumeAPI(object):
         cctxt.cast(ctxt, 'retype', volume_id=volume['id'],
                    new_type_id=new_type_id, host=host_p,
                    migration_policy=migration_policy,
-                   reservations=reservations)
+                   reservations=reservations,
+                   old_reservations=old_reservations)
 
     def manage_existing(self, ctxt, volume, ref):
         new_host = utils.extract_host(volume['host'])

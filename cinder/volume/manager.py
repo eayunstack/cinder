@@ -1484,7 +1484,8 @@ class VolumeManager(manager.SchedulerDependentManager):
             extra_usage_info={'size': int(new_size)})
 
     def retype(self, ctxt, volume_id, new_type_id, host,
-               migration_policy='never', reservations=None):
+               migration_policy='never', reservations=None,
+               old_reservations=None):
 
         def _retype_error(context, volume_id, old_reservations,
                           new_reservations, status_update):
@@ -1516,21 +1517,33 @@ class VolumeManager(manager.SchedulerDependentManager):
                 # for now.
                 self.db.volume_update(context, volume_id, status_update)
 
-        # Get old reservations
-        try:
-            reserve_opts = {'volumes': -1, 'gigabytes': -volume_ref['size']}
-            QUOTAS.add_volume_type_opts(context,
-                                        reserve_opts,
-                                        volume_ref.get('volume_type_id'))
-            old_reservations = QUOTAS.reserve(context,
-                                              project_id=project_id,
-                                              **reserve_opts)
-        except Exception:
-            old_reservations = None
-            self.db.volume_update(context, volume_id, status_update)
-            LOG.exception(_("Failed to update usages while retyping volume."))
-            raise exception.CinderException(_("Failed to get old volume type"
-                                              " quota reservations"))
+        # If old_reservations has been passed in from the API, we should
+        # skip quotas.
+        # TODO(ntpttr): These reservation checks are left in to be backwards
+        #               compatible with Liberty and can be removed in N.
+        if not old_reservations:
+            # Get old reservations
+            try:
+                reserve_opts = {'volumes': -1,
+                                'gigabytes': -volume_ref['size']}
+                QUOTAS.add_volume_type_opts(context,
+                                            reserve_opts,
+                                            volume_ref.get('volume_type_id'))
+                # NOTE(wanghao): We don't need to reserve volumes and gigabytes
+                # quota for retyping operation since they didn't changed, just
+                # reserve volume_type and type gigabytes is fine.
+                reserve_opts.pop('volumes')
+                reserve_opts.pop('gigabytes')
+                old_reservations = QUOTAS.reserve(context,
+                                                  project_id=project_id,
+                                                  **reserve_opts)
+            except Exception:
+                old_reservations = None
+                self.db.volume_update(context, volume_id, status_update)
+                LOG.exception(_("Failed to update usages while retyping"
+                                " volume."))
+                raise exception.CinderException(_("Failed to get old volume"
+                                                  " type quota reservations"))
 
         # We already got the new reservations
         new_reservations = reservations

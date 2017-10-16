@@ -1234,8 +1234,27 @@ class API(base.Base):
         # We're checking here in so that we can report any quota issues as
         # early as possible, but won't commit until we change the type. We
         # pass the reservations onward in case we need to roll back.
-        reservations = quota_utils.get_volume_type_reservation(context, volume,
-                                                               vol_type_id)
+        reservations = quota_utils.get_volume_type_reservation(
+            context, volume, vol_type_id, reserve_vol_type_only=True)
+
+        # Get old reservations
+        try:
+            reserve_opts = {'volumes': -1, 'gigabytes': -volume['size']}
+            QUOTAS.add_volume_type_opts(context,
+                                        reserve_opts,
+                                        old_vol_type_id)
+            # NOTE(wanghao): We don't need to reserve volumes and gigabytes
+            # quota for retyping operation since they didn't changed, just
+            # reserve volume_type and type gigabytes is fine.
+            reserve_opts.pop('volumes')
+            reserve_opts.pop('gigabytes')
+            old_reservations = QUOTAS.reserve(context,
+                                              project_id=volume['project_id'],
+                                              **reserve_opts)
+        except Exception:
+            LOG.exception(_("Failed to update quota usage while retyping"
+                            " volume."))
+            raise exception.CinderException(msg)
 
         self.update(context, volume, {'status': 'retyping'})
 
@@ -1243,7 +1262,8 @@ class API(base.Base):
                         'volume_id': volume['id'],
                         'volume_type': vol_type,
                         'migration_policy': migration_policy,
-                        'quota_reservations': reservations}
+                        'quota_reservations': reservations,
+                        'old_reservations': old_reservations}
 
         self.scheduler_rpcapi.retype(context, CONF.volume_topic, volume['id'],
                                      request_spec=request_spec,
