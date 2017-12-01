@@ -1253,6 +1253,11 @@ class CephBackupDriver(BackupDriver):
                 volume.create_snap(snap)
                 volume.protect_snap(snap)
 
+            def _cleanup_backup_temp_snapshot():
+                volume.unprotect_snap(snap)
+                if not snapshot['name']:
+                    volume.remove_snap(snap)
+
             with rbd_driver.RADOSClient(self,
                                         str(parent_pool))as dest_client:
                 # clone backup into Glance's storage pool.
@@ -1263,12 +1268,19 @@ class CephBackupDriver(BackupDriver):
                                snap=snap,
                                dest_pool=parent_pool,
                                dest_name=image_meta['id']))
-                self.rbd.RBD().clone(volume.ioctx,
-                                     volume_name,
-                                     snap,
-                                     dest_client.ioctx,
-                                     str(image_meta['id']),
-                                     features=self.rbd.RBD_FEATURE_LAYERING)
+
+                try:
+                    self.rbd.RBD().clone(volume.ioctx,
+                                         volume_name,
+                                         snap,
+                                         dest_client.ioctx,
+                                         str(image_meta['id']),
+                                         features=(self.rbd
+                                                   .RBD_FEATURE_LAYERING))
+                except Exception:
+                    _cleanup_backup_temp_snapshot()
+                    raise
+
                 try:
                     dest_volume = self.rbd.Image(dest_client.ioctx,
                                                  strutils.safe_encode(
@@ -1280,6 +1292,7 @@ class CephBackupDriver(BackupDriver):
                     self.rbd.RBD().remove(dest_client.ioctx,
                                           strutils.safe_encode(
                                               image_meta['id']))
+                    _cleanup_backup_temp_snapshot()
                     raise
 
                 try:
@@ -1296,12 +1309,6 @@ class CephBackupDriver(BackupDriver):
                     # (which is not configurable)
                     dest_volume.create_snap(strutils.safe_encode('snap'))
                     dest_volume.protect_snap(strutils.safe_encode('snap'))
-
-                    # all done with the source snapshot
-                    # backup snap is unprotected originally,so unprotect it
-                    volume.unprotect_snap(snap)
-                    if not snapshot['name']:
-                        volume.remove_snap(snap)
 
                     # prepare the metadata
                     metadata = {
@@ -1324,6 +1331,7 @@ class CephBackupDriver(BackupDriver):
                                                      dest_volume)
                     raise
                 finally:
+                    _cleanup_backup_temp_snapshot()
                     dest_volume.close()
 
         return True
