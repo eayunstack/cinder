@@ -290,16 +290,22 @@ def fetch_to_volume_format(context, image_service,
 
 def upload_volume(context, image_service, image_meta, volume_path,
                   volume_format='raw'):
+    upload(context, image_service, image_meta, volume_path,
+           volume_format)
+
+
+def upload(context, image_service, image_meta, src_path,
+           volume_format='raw'):
     image_id = image_meta['id']
     if (image_meta['disk_format'] == volume_format):
         LOG.debug("%s was %s, no need to convert to %s" %
                   (image_id, volume_format, image_meta['disk_format']))
-        if os.name == 'nt' or os.access(volume_path, os.R_OK):
-            with fileutils.file_open(volume_path, 'rb') as image_file:
+        if os.name == 'nt' or os.access(src_path, os.R_OK):
+            with fileutils.file_open(src_path, 'rb') as image_file:
                 image_service.update(context, image_id, {}, image_file)
         else:
-            with utils.temporary_chown(volume_path):
-                with fileutils.file_open(volume_path) as image_file:
+            with utils.temporary_chown(src_path):
+                with fileutils.file_open(src_path) as image_file:
                     image_service.update(context, image_id, {}, image_file)
         return
 
@@ -312,7 +318,7 @@ def upload_volume(context, image_service, image_meta, volume_path,
     with fileutils.remove_path_on_error(tmp):
         LOG.debug("%s was %s, converting to %s" %
                   (image_id, volume_format, image_meta['disk_format']))
-        convert_image(volume_path, tmp, image_meta['disk_format'],
+        convert_image(src_path, tmp, image_meta['disk_format'],
                       bps_limit=CONF.volume_copy_bps_limit)
 
         data = qemu_img_info(tmp)

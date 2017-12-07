@@ -185,6 +185,7 @@ class SchedulerManager(manager.Manager):
 
         volume_ref = db.volume_get(context, volume_id)
         reservations = request_spec.get('quota_reservations')
+        old_reservations = request_spec.get('old_reservations', None)
         new_type = request_spec.get('volume_type')
         if new_type is None:
             msg = _('New volume type not specified in request_spec.')
@@ -214,7 +215,9 @@ class SchedulerManager(manager.Manager):
         else:
             volume_rpcapi.VolumeAPI().retype(context, volume_ref,
                                              new_type['id'], tgt_host,
-                                             migration_policy, reservations)
+                                             migration_policy,
+                                             reservations,
+                                             old_reservations)
 
     def manage_existing(self, context, topic, volume_id,
                         request_spec, filter_properties=None):

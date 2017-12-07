@@ -50,6 +50,8 @@ from cinder import rpc
 from cinder import utils
 from cinder.volume import utils as volume_utils
 
+from cinder.image import glance
+
 LOG = logging.getLogger(__name__)
 
 backup_manager_opts = [
@@ -196,19 +198,10 @@ class BackupManager(manager.SchedulerDependentManager):
             self._cleanup_incomplete_backup_operations(ctxt)
         except Exception:
             # Don't block startup of the backup service.
-            LOG.exception(_("Problem cleaning incomplete backup "
-                              "operations."))
+            LOG.exception(_("Problem cleaning incomplete backup operations."))
 
     def _cleanup_incomplete_backup_operations(self, ctxt):
         LOG.info(_("Cleaning up incomplete backup operations."))
-        volumes = self.db.volume_get_all_by_host(ctxt, self.host)
-
-        for volume in volumes:
-            try:
-                self._cleanup_one_volume(ctxt, volume)
-            except Exception:
-                LOG.exception(_("Problem cleaning up volume %(vol)s."),
-                              {'vol': volume['id']})
 
         # TODO(smulcahy) implement full resume of backup and restore
         # operations on restart (rather than simply resetting)
@@ -223,8 +216,8 @@ class BackupManager(manager.SchedulerDependentManager):
                 self._cleanup_temp_volumes_snapshots_for_one_backup(ctxt,
                                                                     backup)
             except Exception:
-                LOG.exception(_("Problem cleaning temp volumes and "
-                                  "snapshots for backup %(bkup)s."),
+                LOG.exception(_("Problem cleaning temp volumes and snapshots"
+                                " for backup %(bkup)s."),
                               {'bkup': backup['id']})
 
     def _cleanup_one_volume(self, ctxt, volume):
@@ -233,16 +226,16 @@ class BackupManager(manager.SchedulerDependentManager):
         mgr = self._get_manager(backend)
         if volume['status'] == 'backing-up':
             self._detach_volume(ctxt, mgr, volume)
-            LOG.info(_('Resetting volume %(vol_id)s to previous '
-                         'status %(status)s (was backing-up).'),
+            LOG.info(_('Resetting volume %(vol_id)s to previous status'
+                       ' %(status)s (was backing-up).'),
                      {'vol_id': volume['id'],
                       'status': volume['previous_status']})
             self.db.volume_update(ctxt, volume['id'],
                                   {'status': volume['previous_status']})
         elif volume['status'] == 'restoring-backup':
             self._detach_volume(ctxt, mgr, volume)
-            LOG.info(_('setting volume %s to error_restoring '
-                         '(was restoring-backup).'), volume['id'])
+            LOG.info(_('setting volume %s to error_restoring'
+                       ' (was restoring-backup).'), volume['id'])
             self.db.volume_update(ctxt, volume['id'],
                                   {'status': 'error_restoring'})
 
@@ -250,26 +243,32 @@ class BackupManager(manager.SchedulerDependentManager):
         if backup['status'] == 'creating':
             LOG.info(_('Resetting backup %s to error (was creating).'),
                      backup['id'])
+
+            volume = self.db.volume_get(ctxt, backup['volume_id'])
+            self._cleanup_one_volume(ctxt, volume)
+
             err = 'incomplete backup reset on manager restart'
             backup['status'] = 'error'
             backup['fail_reason'] = err
             self.db.backup_update(ctxt, backup['id'], {'status': 'error',
                                                        'fail_reason': err})
-        if backup['status'] == 'restoring':
-            LOG.info(_('Resetting backup %s to '
-                         'available (was restoring).'),
+        elif backup['status'] == 'restoring':
+            LOG.info(_('Resetting backup %s to available (was restoring).'),
                      backup['id'])
+            volume = self.db.volume_get(ctxt, backup['restore_volume_id'])
+            self._cleanup_one_volume(ctxt, volume)
+
             backup['status'] = 'available'
             self.db.backup_update(ctxt, backup['id'],
                                   {'status': 'available'})
-        if backup['status'] == 'deleting':
+        elif backup['status'] == 'deleting':
             LOG.info(_('Resuming delete on backup: %s.'), backup['id'])
             self.delete_backup(ctxt, backup['id'])
 
     def _detach_volume(self, ctxt, mgr, volume):
         if (volume['attach_status'] == 'attached' and
                 volume['attached_host'] == self.host and
-                volume['instance_uuid'] == None):
+                volume['instance_uuid'] is None):
             try:
                 mgr.detach_volume(ctxt, volume['id'])
             except Exception:
@@ -282,20 +281,20 @@ class BackupManager(manager.SchedulerDependentManager):
         # that are not deleted. Make sure any temporary volumes or snapshots
         # create by the backup job are deleted when service is started.
         try:
-            volume = self.db.volume_get(ctxt, backup.volume_id)
+            volume = self.db.volume_get(ctxt, backup['volume_id'])
             volume_host = volume_utils.extract_host(volume['host'],
                                                     'backend')
             backend = self._get_volume_backend(host=volume_host)
             mgr = self._get_manager(backend)
         except (KeyError, exception.VolumeNotFound):
             LOG.debug("Could not find a volume to clean up for "
-                      "backup %s.", backup.id)
+                      "backup %s.", backup['id'])
             return
 
         if backup['temp_volume_id'] and backup['status'] == 'error':
             try:
                 temp_volume = self.db.volume_get(ctxt,
-                                                 backup.temp_volume_id)
+                                                 backup['temp_volume_id'])
                 # The temp volume should be deleted directly thru the
                 # the volume driver, not thru the volume manager.
                 mgr.driver.delete_volume(temp_volume)
@@ -303,8 +302,8 @@ class BackupManager(manager.SchedulerDependentManager):
             except exception.VolumeNotFound:
                 LOG.debug("Could not find temp volume %(vol)s to clean up "
                           "for backup %(backup)s.",
-                          {'vol': backup.temp_volume_id,
-                           'backup': backup.id})
+                          {'vol': backup['temp_volume_id'],
+                           'backup': backup['id']})
             backup['temp_volume_id'] = None
             self.db.backup_update(ctxt, backup['id'],
                                   {'temp_volume_id': None})
@@ -312,12 +311,12 @@ class BackupManager(manager.SchedulerDependentManager):
         if backup['temp_snapshot_id'] and backup['status'] == 'error':
             try:
                 temp_snapshot = self.db.snapshot_get(
-                        ctxt, backup['temp_snapshot_id'])
+                    ctxt, backup['temp_snapshot_id'])
                 # The temp snapshot should be deleted directly thru the
                 # volume driver, not thru the volume manager.
                 mgr.driver.delete_snapshot(temp_snapshot)
                 self.db.volume_glance_metadata_delete_by_snapshot(
-                        ctxt, temp_snapshot['id'])
+                    ctxt, temp_snapshot['id'])
                 self.db.snapshot_destroy(ctxt, temp_snapshot['id'])
             except exception.SnapshotNotFound:
                 LOG.debug("Could not find temp snapshot %(snap)s to clean "
@@ -335,9 +334,10 @@ class BackupManager(manager.SchedulerDependentManager):
         volume = self.db.volume_get(context, volume_id)
         previous_status = volume.get('previous_status', None)
         LOG.info(_('Create backup started, backup: %(backup_id)s '
-                     'volume: %(volume_id)s.'),
+                   'volume: %(volume_id)s.'),
                  {'backup_id': backup['id'], 'volume_id': volume_id})
 
+        self._notify_about_backup_usage(context, backup, "create.start")
         volume_host = volume_utils.extract_host(volume['host'], 'backend')
         backend = self._get_volume_backend(host=volume_host)
 
@@ -399,11 +399,98 @@ class BackupManager(manager.SchedulerDependentManager):
         self.db.volume_update(context, volume_id,
                               {'status': previous_status,
                                'previous_status': 'backing-up'})
-        self.db.backup_update(context, backup_id, {'status': 'available',
-                                                   'size': volume['size'],
-                                                   'availability_zone':
-                                                   self.az})
+        backup = self.db.backup_update(context, backup_id,
+                                       {'status': 'available',
+                                        'size': volume['size'],
+                                        'availability_zone': self.az})
         LOG.info(_('Create backup finished. backup: %s.'), backup_id)
+        self._notify_about_backup_usage(context, backup, "create.end")
+
+    def _delete_image(self, context, image_id, image_service):
+        """Deletes an image stuck in queued or saving state."""
+        try:
+            image_meta = image_service.show(context, image_id)
+            image_status = image_meta.get('status')
+            if image_status == 'queued' or image_status == 'saving':
+                LOG.warn("Deleting image %(image_id)s in %(image_status)s "
+                         "state.",
+                         {'image_id': image_id,
+                          'image_status': image_status})
+            image_service.delete(context, image_id)
+        except Exception:
+            LOG.warn(_("Error occurred while deleting image %s."),
+                     image_id, exc_info=True)
+
+    def upload_backup_to_image(self, context, backup, image_meta):
+        """Uploads the specified backup to Glance.
+
+        image_meta is a dictionary containing the following keys:
+        'id', 'container_format', 'disk_format'
+
+        """
+        LOG.info(_('Upload backup started, backup: %(backup_id)s '
+                   'image_id: %(image_id)s.'),
+                 {'backup_id': backup['id'], 'image_id': image_meta['id']})
+        self.db.backup_update(context, backup['id'], {'host': self.host})
+        self._notify_about_backup_usage(context, backup, "upload.start")
+
+        payload = {'backup_id': backup['id'], 'image_id': image_meta['id']}
+
+        expected_status = 'uploading'
+        actual_status = backup['status']
+        if actual_status != expected_status:
+            err = (_('Upload backup aborted: expected backup status '
+                     '%(expected_status)s but got %(actual_status)s.') %
+                   {'expected_status': expected_status,
+                    'actual_status': actual_status})
+            self.db.backup_update(context, backup['id'], {'status': 'error',
+                                  'fail_reason': err})
+            raise exception.InvalidBackup(reason=err)
+
+        backup_service = self._map_service_to_driver(backup['service'])
+        configured_service = self.driver_name
+        if backup_service != configured_service:
+            err = _('Upload backup aborted, the backup service currently'
+                    ' configured [%(configured_service)s] is not the'
+                    ' backup service that was used to create this'
+                    ' backup [%(backup_service)s].') % {
+                'configured_service': configured_service,
+                'backup_service': backup_service,
+            }
+            self.db.backup_update(context, backup['id'],
+                                  {'status': 'available'})
+            raise exception.InvalidBackup(reason=err)
+
+        try:
+
+            utils.require_driver_initialized(self.driver)
+            image_service, image_id = \
+                glance.get_remote_image_service(context, image_meta['id'])
+
+            backup_service = self.service.get_backup_driver(context)
+
+            backup_service.upload_backup_to_image(backup,
+                                                  image_service,
+                                                  image_meta)
+        except Exception as error:
+            LOG.error(_("Error occurred while uploading backup %(backup_id)s "
+                        "to image %(image_id)s."),
+                      {'backup_id': backup['id'],
+                       'image_id': image_meta['id']})
+            if image_service is not None:
+                # Deletes the image if it is in queued or saving state
+                self._delete_image(context, image_meta['id'], image_service)
+
+            with excutils.save_and_reraise_exception():
+                payload['message'] = unicode(error)
+        finally:
+            backup = self.db.backup_update(context, backup['id'],
+                                           {'status': 'available'})
+
+        LOG.info(_('Upload backup finished, backup %(backup_id)s uploaded'
+                   ' to glance %(image_id)s.') %
+                 {'backup_id': backup['id'], 'image_id': image_meta['id']})
+        self._notify_about_backup_usage(context, backup, "upload.end")
 
     def restore_backup(self, context, backup_id, volume_id):
         """Restore volume backups from configured backup service."""
@@ -415,6 +502,7 @@ class BackupManager(manager.SchedulerDependentManager):
         volume = self.db.volume_get(context, volume_id)
         volume_host = volume_utils.extract_host(volume['host'], 'backend')
         backend = self._get_volume_backend(host=volume_host)
+        self._notify_about_backup_usage(context, backup, "restore.start")
 
         self.db.backup_update(context, backup_id, {'host': self.host})
 
@@ -482,10 +570,12 @@ class BackupManager(manager.SchedulerDependentManager):
                                       {'status': 'available'})
 
         self.db.volume_update(context, volume_id, {'status': 'available'})
-        self.db.backup_update(context, backup_id, {'status': 'available'})
+        backup = self.db.backup_update(context, backup_id,
+                                       {'status': 'available'})
         LOG.info(_('Restore backup finished, backup %(backup_id)s restored'
                    ' to volume %(volume_id)s.') %
                  {'backup_id': backup_id, 'volume_id': volume_id})
+        self._notify_about_backup_usage(context, backup, "restore.end")
 
     def delete_backup(self, context, backup_id):
         """Delete volume backup from configured backup service."""
@@ -504,6 +594,7 @@ class BackupManager(manager.SchedulerDependentManager):
 
         LOG.info(_('Delete backup started, backup: %s.'), backup_id)
         backup = self.db.backup_get(context, backup_id)
+        self._notify_about_backup_usage(context, backup, "delete.start")
         self.db.backup_update(context, backup_id, {'host': self.host})
 
         expected_status = 'deleting'
@@ -563,6 +654,17 @@ class BackupManager(manager.SchedulerDependentManager):
                           project_id=backup['project_id'])
 
         LOG.info(_('Delete backup finished, backup %s deleted.'), backup_id)
+        self._notify_about_backup_usage(context, backup, "delete.end")
+
+    def _notify_about_backup_usage(self,
+                                   context,
+                                   backup,
+                                   event_suffix,
+                                   extra_usage_info=None):
+        volume_utils.notify_about_backup_usage(
+            context, backup, event_suffix,
+            extra_usage_info=extra_usage_info,
+            host=self.host)
 
     def export_record(self, context, backup_id):
         """Export all volume backup metadata details to allow clean import.

@@ -48,6 +48,7 @@ from cinder.openstack.common import log as logging
 from cinder.openstack.common import timeutils
 from cinder.openstack.common import uuidutils
 
+from sqlalchemy.sql.expression import desc
 
 CONF = cfg.CONF
 CONF.import_group("profiler", "cinder.service")
@@ -1715,6 +1716,19 @@ def snapshot_get_all_for_volume(context, volume_id):
         filter_by(volume_id=volume_id).\
         options(joinedload('snapshot_metadata')).\
         all()
+
+
+@require_context
+def snapshot_get_latest_for_volume(context, volume_id):
+    result = model_query(context, models.Snapshot, read_deleted='no',
+                         project_only=True).\
+        filter_by(volume_id=volume_id).\
+        options(joinedload('snapshot_metadata')).\
+        order_by(desc(models.Snapshot.created_at)).\
+        first()
+    if not result:
+        raise exception.VolumeSnapshotNotFound(volume_id=volume_id)
+    return result
 
 
 @require_context

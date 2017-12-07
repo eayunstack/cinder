@@ -249,6 +249,7 @@ class RBDDriver(driver.VolumeDriver):
     """Implements RADOS block device (RBD) volume commands."""
 
     VERSION = '1.1.0'
+    support_reverting_to_any_snapshot = True
 
     def __init__(self, *args, **kwargs):
         super(RBDDriver, self).__init__(*args, **kwargs)
@@ -683,6 +684,24 @@ class RBDDriver(driver.VolumeDriver):
                 # will be deleted when it's snapshot and clones are deleted.
                 new_name = "%s.deleted" % (volume_name)
                 self.rbd.RBD().rename(client.ioctx, volume_name, new_name)
+
+    def revert_to_snapshot(self, context, volume, snapshot):
+        """Revert a volume to a snapshot"""
+        volume_name = "volume-" + volume['id']
+        snap_name = "snapshot-" + snapshot['id']
+
+        with RBDVolumeProxy(self, volume_name) as dest_volume:
+            try:
+                dest_volume.rollback_to_snap(strutils.safe_encode(snap_name))
+            except self.rbd.ImageNotFound:
+                LOG.error("RBD volume %s not found, allowing revert"
+                          "operation to proceed.", volume_name)
+                raise exception.VolumeNotFound(volume_id=volume_name)
+
+            # resize rbd to snap volume size if the snapshot is created
+            # before the rbd extended
+            if volume['size'] != snapshot['volume_size']:
+                dest_volume.resize(int(volume['size']) * units.Gi)
 
     def create_snapshot(self, snapshot):
         """Creates an rbd snapshot."""

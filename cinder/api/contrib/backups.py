@@ -267,6 +267,45 @@ class BackupsController(wsgi.Controller):
         return retval
 
     @wsgi.response(202)
+    def upload(self, req, id, body):
+        """Upload an existing backup to image service."""
+        LOG.debug('Uploading backup %(backup_id)s (%(body)s)',
+                  {'backup_id': id, 'body': body})
+
+        if not self.is_valid_body(body, 'upload'):
+            msg = _("Incorrect request body format")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        context = req.environ['cinder.context']
+        params = body['upload']
+        if not params.get("image_name"):
+            msg = _("No image_name was specified in request.")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        image_metadata = {
+            "container_format": params.get(
+                "container_format", "bare"),
+            "disk_format": params.get("disk_format", "raw"),
+            "name": params["image_name"],
+            }
+
+        backup = self.backup_api.get(context, id)
+        try:
+            response = self.backup_api.upload(context,
+                                              backup,
+                                              image_metadata)
+        except exception.InvalidBackup as error:
+            raise webob.exc.HTTPBadRequest(explanation=error.msg)
+        except exception.GlanceOperationFailed as error:
+            raise webob.exc.HTTPBadRequest(explanation=error.msg)
+        except Exception as error:
+            raise webob.exc.HTTPBadRequest(explanation=unicode(error))
+
+        retval = self._view_builder.upload_summary(
+            req, dict(response))
+        return retval
+
+    @wsgi.response(202)
     @wsgi.serializers(xml=BackupRestoreTemplate)
     @wsgi.deserializers(xml=RestoreDeserializer)
     def restore(self, req, id, body):
@@ -379,7 +418,7 @@ class Backups(extensions.ExtensionDescriptor):
         res = extensions.ResourceExtension(
             Backups.alias, BackupsController(),
             collection_actions={'detail': 'GET', 'import_record': 'POST'},
-            member_actions={'restore': 'POST', 'export_record': 'GET',
-                            'action': 'POST'})
+            member_actions={'restore': 'POST', 'upload': 'POST',
+                            'export_record': 'GET', 'action': 'POST'})
         resources.append(res)
         return resources

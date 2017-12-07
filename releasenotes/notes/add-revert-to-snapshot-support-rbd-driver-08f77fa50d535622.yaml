@@ -1,0 +1,3 @@
+---
+features:
+  - Add revert to snapshot support in RBD driver.

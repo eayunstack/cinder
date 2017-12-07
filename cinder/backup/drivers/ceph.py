@@ -61,6 +61,13 @@ from cinder.openstack.common import units
 from cinder import utils
 import cinder.volume.drivers.rbd as rbd_driver
 
+from cinder.openstack.common import fileutils
+from cinder.image import image_utils
+import uuid
+import urllib
+import json
+import tempfile
+
 try:
     import rados
     import rbd
@@ -88,7 +95,10 @@ service_opts = [
                help='RBD stripe count to use when creating a backup image.'),
     cfg.BoolOpt('restore_discard_excess_bytes', default=True,
                 help='If True, always discard excess bytes when restoring '
-                     'volumes i.e. pad with zeroes.')
+                     'volumes i.e. pad with zeroes.'),
+    cfg.StrOpt('image_upload_use_clone',
+               default='True',
+               help='If True, use backend clone for efficiently upload. '),
 ]
 
 CONF = cfg.CONF
@@ -283,7 +293,7 @@ class CephBackupDriver(BackupDriver):
             if self._file_is_rbd(volume):
                 volume.rbd_image.discard(offset, length)
             else:
-                zeroes = '\0' * length
+                zeroes = '\0' * self.chunk_size
                 chunks = int(length / self.chunk_size)
                 for chunk in xrange(0, chunks):
                     LOG.debug("Writing zeroes chunk %d" % chunk)
@@ -1134,6 +1144,355 @@ class CephBackupDriver(BackupDriver):
             msg = _("Metadata restore failed due to incompatible version")
             LOG.error(msg)
             raise exception.BackupOperationError(msg)
+
+    def _parse_image_loc(self, location):
+        prefix = 'rbd://'
+        if not location.startswith(prefix):
+            reason = _('Not stored in rbd')
+            raise exception.ImageUnacceptable(image_id=location, reason=reason)
+        pieces = map(urllib.unquote, location[len(prefix):].split('/'))
+        if '' in pieces:
+            reason = _('Blank components')
+            raise exception.ImageUnacceptable(image_id=location, reason=reason)
+        if len(pieces) != 4:
+            reason = _('Not an rbd snapshot')
+            raise exception.ImageUnacceptable(image_id=location, reason=reason)
+        return pieces
+
+    def _get_image_ref(self, volume_id):
+        """Helper method to get image_ref."""
+        json_meta = self.get_metadata(volume_id)
+        metadata = json.loads(json_meta)
+        if 'image_id' in metadata['volume-glance-metadata']:
+            return metadata['volume-glance-metadata']['image_id']
+        else:
+            return None
+
+    def _get_parent_pool(self, image_service, base_image_id, fsid):
+        parent_pool = None
+
+        try:
+            locations = image_service.get_location(self.context, base_image_id)
+        except Exception as e:
+            LOG.debug('Unable to get image %(image_id)s location; error:'
+                      ' %(error)s', {'image_id': base_image_id, 'error': e})
+            locations = ()
+
+        # Find the first location that is in the same RBD cluster
+        for location in locations:
+            if location is None:
+                continue
+            try:
+                parent_fsid, parent_pool, _im, _snap = \
+                    self._parse_image_loc(location)
+                if parent_fsid == fsid:
+                    break
+                else:
+                    parent_pool = None
+            except exception.ImageUnacceptable:
+                continue
+
+        return parent_pool
+
+    def _delete_cloned_glance_image(self, name, ioctx, rbd_image):
+        """Deletes a cloned glance image."""
+        volume_name = strutils.safe_encode(name)
+        snap = strutils.safe_encode('snap')
+
+        try:
+            if rbd_image.is_protected_snap(snap):
+                rbd_image.unprotect_snap(snap)
+            rbd_image.remove_snap(snap)
+        except self.rbd.ImageBusy:
+            raise exception.SnapshotIsBusy(snapshot_name='snap')
+        except self.rbd.ImageNotFound:
+            pass
+
+        LOG.debug("deleting cloned glance image %s" % (volume_name))
+        try:
+            self.rbd.RBD().remove(ioctx, volume_name)
+        except self.rbd.ImageBusy:
+            msg = (_("ImageBusy error raised while deleting rbd "
+                     "volume. This may have been caused by a "
+                     "connection from a client that has crashed and, "
+                     "if so, may be resolved by retrying the delete "
+                     "after 30 seconds has elapsed."))
+            LOG.warn(msg)
+            raise exception.VolumeIsBusy(msg, volume_name=volume_name)
+
+    def clone_backup_to_image(self, backup, image_service,
+                              image_meta, snapshot):
+        """Clone volume and register its location to the image."""
+
+        volume_name = snapshot['volume_name']
+        if snapshot['name']:
+            snap = snapshot['name']
+        else:
+            snap = strutils.safe_encode(uuid.uuid4().hex)
+
+        base_image_id = self._get_image_ref(backup['volume_id'])
+
+        with rbd_driver.RBDVolumeProxy(self, volume_name) as volume:
+            fsid = volume.client.get_fsid()
+
+            # Cinder has zero comprehension of how Glance's image store is
+            # configured, but we can infer what storage pool Glance is using
+            # by looking at the parent image.  If using authx, write access
+            # should be enabled on that pool for the Nova user
+            parent_pool = self._get_parent_pool(image_service,
+                                                base_image_id, fsid)
+            if parent_pool is None:
+                return False
+
+            # librbd requires that snapshots be set to "protected"
+            # in order to clone them
+            if snapshot['name']:
+                if not volume.is_protected_snap(snap):
+                    volume.protect_snap(snap)
+            else:
+                volume.create_snap(snap)
+                volume.protect_snap(snap)
+
+            def _cleanup_backup_temp_snapshot():
+                volume.unprotect_snap(snap)
+                if not snapshot['name']:
+                    volume.remove_snap(snap)
+
+            with rbd_driver.RADOSClient(self,
+                                        str(parent_pool))as dest_client:
+                # clone backup into Glance's storage pool.
+                LOG.debug('cloning %(pool)s/%(img)s@%(snap)s to '
+                          '%(dest_pool)s/%(dest_name)s',
+                          dict(pool=self._ceph_backup_pool,
+                               img=volume_name,
+                               snap=snap,
+                               dest_pool=parent_pool,
+                               dest_name=image_meta['id']))
+
+                try:
+                    self.rbd.RBD().clone(volume.ioctx,
+                                         volume_name,
+                                         snap,
+                                         dest_client.ioctx,
+                                         str(image_meta['id']),
+                                         features=(self.rbd
+                                                   .RBD_FEATURE_LAYERING))
+                except Exception:
+                    _cleanup_backup_temp_snapshot()
+                    raise
+
+                try:
+                    dest_volume = self.rbd.Image(dest_client.ioctx,
+                                                 strutils.safe_encode(
+                                                     image_meta['id']),
+                                                 snapshot=None,
+                                                 read_only=False)
+                except Exception:
+                    # if failed to get dest_volume, removing maybe fails
+                    self.rbd.RBD().remove(dest_client.ioctx,
+                                          strutils.safe_encode(
+                                              image_meta['id']))
+                    _cleanup_backup_temp_snapshot()
+                    raise
+
+                try:
+                    # Flatten the image, which detaches it from the
+                    # source snapshot
+                    LOG.debug('flattening %(pool)s/%(img)s' %
+                              dict(pool=parent_pool, img=image_meta['id']))
+                    dest_volume.flatten()
+
+                    # Glance makes a protected snapshot called 'snap' on
+                    # uploaded images and hands it out, so we'll do that too.
+                    # The name of the snapshot doesn't really matter, this
+                    # just uses what the glance-store rbd backend sets
+                    # (which is not configurable)
+                    dest_volume.create_snap(strutils.safe_encode('snap'))
+                    dest_volume.protect_snap(strutils.safe_encode('snap'))
+
+                    # prepare the metadata
+                    metadata = {
+                        'status': 'active',
+                        'name': str(image_meta['name']),
+                    }
+                    metadata['disk_format'] = 'raw'
+                    metadata['container_format'] = 'bare'
+                    metadata['version'] = 1
+                    metadata['location'] = \
+                        str('rbd://%(fsid)s/%(pool)s/%(image)s/snap' %
+                            dict(fsid=fsid, pool=parent_pool,
+                                 image=image_meta['id']))
+                    image_service.update(self.context, str(image_meta['id']),
+                                         metadata, data=None,
+                                         purge_props=False)
+                except Exception:
+                    self._delete_cloned_glance_image(image_meta['id'],
+                                                     dest_client.ioctx,
+                                                     dest_volume)
+                    raise
+                finally:
+                    _cleanup_backup_temp_snapshot()
+                    dest_volume.close()
+
+        return True
+
+    def _image_conversion_dir(self):
+        tmpdir = (CONF.image_conversion_dir or
+                  tempfile.gettempdir())
+
+        # ensure temporary directory exists
+        if not os.path.exists(tmpdir):
+            os.makedirs(tmpdir)
+
+        return tmpdir
+
+    def _get_snapshot(self, backup):
+        """returns: (rbd_name,snap)"""
+        if backup['id'] is None:
+            msg = _("Backup id required")
+            raise exception.InvalidParameterValue(msg)
+
+        with rbd_driver.RADOSClient(self, self._ceph_backup_pool) as client:
+            # diff format
+            base_name = self._get_backup_base_name(backup['volume_id'],
+                                                   diff_format=True)
+            rbd_exists, base_name = self._rbd_image_exists(base_name,
+                                                           backup['volume_id'],
+                                                           client)
+            if rbd_exists:
+                base_rbd = self.rbd.Image(client.ioctx,
+                                          base_name,
+                                          read_only=True)
+                try:
+                    upload_point = \
+                        self._get_backup_snap_name(base_rbd, base_name,
+                                                   backup['id'])
+                finally:
+                    base_rbd.close()
+
+                if upload_point:
+                    return (base_name, upload_point)
+
+            # no snap format
+            rbd_name = self._get_backup_base_name(backup['volume_id'],
+                                                  backup['id'])
+            rbd_exists, rbd_name = self._rbd_image_exists(rbd_name,
+                                                          backup['volume_id'],
+                                                          client)
+            if rbd_exists:
+                return (rbd_name, None)
+
+        raise self.rbd.ImageNotFound(_("backup %s image not found") %
+                                     backup['id'])
+
+    def _copy_backup_to_file(self, snapshot, tmp_path, length):
+        """Copy backup to a local file"""
+        rbd_name = snapshot['volume_name']
+        snap_name = snapshot['name']
+
+        with fileutils.file_open(tmp_path, 'wb') as dest_file:
+            with rbd_driver.RBDVolumeProxy(self, rbd_name,
+                                           snapshot=snap_name,
+                                           read_only=True) as src_rbd:
+                try:
+                    rbd_meta = \
+                        rbd_driver.RBDImageMetadata(src_rbd,
+                                                    self._ceph_backup_pool,
+                                                    self._ceph_backup_user,
+                                                    self._ceph_backup_conf)
+                    rbd_fd = rbd_driver.RBDImageIOWrapper(rbd_meta)
+                    self._transfer_data(rbd_fd, rbd_name, dest_file,
+                                        tmp_path, length)
+
+                    # Be tolerant of IO implementations that do not
+                    # support fileno()
+                    try:
+                        fileno = dest_file.fileno()
+                    except IOError:
+                        LOG.debug("copy backup target I/O object does not "
+                                  "support fileno() - skipping call to "
+                                  "fsync().")
+                    else:
+                        os.fsync(fileno)
+                except exception.BackupOperationError as e:
+                    LOG.error(_('Copy to tempfile %(file)s finished with '
+                                'error - %(error)s.') % {'error': e,
+                                                         'file': tmp_path})
+                    raise
+
+    def copy_backup_to_image(self, backup, image_service, image_meta,
+                             snapshot):
+        """Full copy backup to glance in Ceph object store.
+
+        """
+        LOG.debug('Starting full copy from Ceph backup=%(src)s to glance',
+                  {'src': snapshot['volume_name']})
+
+        tmp_dir = self._image_conversion_dir()
+        tmp_path = os.path.join(tmp_dir,
+                                'backup_upload' + '-' + image_meta['id'])
+
+        if tmp_dir and not os.path.exists(tmp_dir):
+            os.makedirs(tmp_dir)
+
+        length = int(backup['size']) * units.Gi
+
+        with fileutils.remove_path_on_error(tmp_path):
+            self._copy_backup_to_file(snapshot, tmp_path, length)
+            image_utils.upload(self.context, image_service,
+                               image_meta, tmp_path)
+        os.unlink(tmp_path)
+
+    def upload_backup_to_image(self, backup, image_service, image_meta):
+        """Upload backup to glance in Ceph object store.
+
+        """
+        LOG.debug('Starting upload from Ceph backup=%(src)s to glance',
+                  {'src': backup['id']})
+
+        try:
+            backup_volume_name, snap = self._get_snapshot(backup)
+        except Exception:
+            LOG.debug("Failed to get rbd name of  backup %s.",
+                      backup['id'])
+            raise
+
+        snapshot = {}
+        snapshot['volume_name'] = strutils.safe_encode(backup_volume_name)
+        if snap is not None:
+            snapshot['name'] = strutils.safe_encode(snap)
+        else:
+            snapshot['name'] = None
+
+        do_clone_upload = False
+        if (image_meta['disk_format'] == 'raw' and
+                image_meta['container_format'] == 'bare'):
+            if self._supports_layering and CONF.image_upload_use_clone:
+                try:
+                    do_clone_upload = \
+                        self.clone_backup_to_image(backup,
+                                                   image_service,
+                                                   image_meta,
+                                                   snapshot)
+                except Exception:
+                    LOG.debug("Cloned backup %(backup_id)s to "
+                              "image-id: %(image_id)s failed.",
+                              {'backup_id': backup['id'],
+                               'image_id': image_meta['id']})
+
+            if do_clone_upload:
+                LOG.debug("Cloned backup %(backup_id)s to "
+                          "image-id: %(image_id)s finished.",
+                          {'backup_id': backup['id'],
+                           'image_id': image_meta['id']})
+        # do full upload
+        if not do_clone_upload:
+            self.copy_backup_to_image(backup, image_service, image_meta,
+                                      snapshot)
+            LOG.debug("Full Upload backup %(backup_id)s to "
+                      "image-id: %(image_id)s finished.",
+                      {'backup_id': backup['id'],
+                       'image_id': image_meta['id']})
 
     def restore(self, backup, volume_id, volume_file):
         """Restore volume from backup in Ceph object store.

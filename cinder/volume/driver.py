@@ -707,6 +707,17 @@ class VolumeDriver(object):
         """Accept the transfer of a volume for a new user/project."""
         pass
 
+    def revert_to_snapshot(self, context, volume, snapshot):
+        """Revert volume to snapshot.
+
+        Note: the revert process should not change the volume's
+        current size, that means if the driver shrank
+        the volume during the process, it should extend the
+        volume internally.
+        """
+        msg = _("Revert volume to snapshot not implemented.")
+        raise NotImplementedError(msg)
+
     def manage_existing(self, volume, existing_ref):
         """Brings an existing backend storage object under Cinder management.
 

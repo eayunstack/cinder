@@ -115,6 +115,12 @@ class VolumeAPI(object):
                    source_volid=source_volid,
                    consistencygroup_id=consistencygroup_id)
 
+    def revert_to_snapshot(self, ctxt, volume, snapshot):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host)
+        cctxt.cast(ctxt, 'revert_to_snapshot', volume=volume,
+                   snapshot=snapshot)
+
     def delete_volume(self, ctxt, volume, unmanage_only=False):
         new_host = utils.extract_host(volume['host'])
         cctxt = self.client.prepare(server=new_host, version='1.15')
@@ -202,7 +208,8 @@ class VolumeAPI(object):
                           error=error)
 
     def retype(self, ctxt, volume, new_type_id, dest_host,
-               migration_policy='never', reservations=None):
+               migration_policy='never', reservations=None,
+               old_reservations=None):
         new_host = utils.extract_host(volume['host'])
         cctxt = self.client.prepare(server=new_host, version='1.12')
         host_p = {'host': dest_host.host,
@@ -210,7 +217,8 @@ class VolumeAPI(object):
         cctxt.cast(ctxt, 'retype', volume_id=volume['id'],
                    new_type_id=new_type_id, host=host_p,
                    migration_policy=migration_policy,
-                   reservations=reservations)
+                   reservations=reservations,
+                   old_reservations=old_reservations)
 
     def manage_existing(self, ctxt, volume, ref):
         new_host = utils.extract_host(volume['host'])

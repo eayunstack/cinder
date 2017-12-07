@@ -57,6 +57,12 @@ class BackupAPI(object):
         cctxt.cast(ctxt, 'restore_backup', backup_id=backup_id,
                    volume_id=volume_id)
 
+    def upload_backup_to_image(self, ctxt, host, backup, image_meta):
+        LOG.debug("upload_backup_to_image in rpcapi backup_id %s", backup['id'])
+        cctxt = self.client.prepare(server=host)
+        cctxt.cast(ctxt, 'upload_backup_to_image', backup=backup,
+                   image_meta=image_meta)
+
     def delete_backup(self, ctxt, host, backup_id):
         LOG.debug("delete_backup  rpcapi backup_id %s", backup_id)
         cctxt = self.client.prepare(server=host)

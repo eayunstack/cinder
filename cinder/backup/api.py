@@ -34,6 +34,8 @@ from cinder import utils
 import cinder.volume
 from cinder.volume import utils as volume_utils
 
+from cinder.image import glance
+
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 QUOTAS = quota.QUOTAS
@@ -202,6 +204,58 @@ class API(base.Base):
 
         return backup
 
+    def upload(self, context, backup, metadata):
+        """Create a new image from the specified backup."""
+
+        if backup['status'] not in ['available']:
+            msg = _('Backup status must be available')
+            raise exception.InvalidBackup(reason=msg)
+
+        size = backup['size']
+        if size is None:
+            msg = _('Backup to upload has invalid size')
+            raise exception.InvalidBackup(reason=msg)
+
+        volume_id = backup['volume_id']
+        if volume_id is None:
+            msg = _('Backup to upload has invalid volume_id')
+            raise exception.InvalidBackup(reason=msg)
+
+        try:
+            image_service = glance.get_default_image_service()
+            metadata['version'] = 1
+            metadata['min_disk'] = backup['size']
+            recv_metadata = image_service.create(context,
+                                                 metadata)
+        except Exception:
+            msg = _('Failed to create glance image')
+            raise exception.GlanceOperationFailed(reason=msg)
+
+        # Setting the status here rather than setting at start and unrolling
+        # for each error condition, it should be a very small window
+        backup_host = volume_utils.extract_host(backup['host'], 'host')
+        backup['status'] = 'uploading'
+        self.db.backup_update(context, backup['id'], {'status': 'uploading'})
+
+        self.backup_rpcapi.upload_backup_to_image(context,
+                                                  backup_host,
+                                                  backup,
+                                                  recv_metadata)
+        response = {"id": backup['id'],
+                    "updated_at": backup['updated_at'],
+                    "status": 'uploading',
+                    "display_description": backup['display_description'],
+                    "size": backup['size'],
+                    "image_id": recv_metadata['id'],
+                    "container_format": recv_metadata['container_format'],
+                    "disk_format": recv_metadata['disk_format'],
+                    "image_name": recv_metadata.get('name', None)}
+        LOG.info(_("Uploading backup %(backup_id)s to image %(image_id)s"),
+                 {'backup_id': backup['id'],
+                  'image_id': recv_metadata['id']})
+
+        return response
+
     def restore(self, context, backup_id, volume_id=None):
         """Make the RPC call to restore a volume backup."""
         check_policy(context, 'restore')
@@ -255,7 +309,10 @@ class API(base.Base):
 
         # Setting the status here rather than setting at start and unrolling
         # for each error condition, it should be a very small window
-        self.db.backup_update(context, backup_id, {'status': 'restoring'})
+        self.db.backup_update(context, backup_id, {
+            'status': 'restoring',
+            'restore_volume_id': volume_id
+            })
         self.db.volume_update(context, volume_id, {'status':
                                                    'restoring-backup'})
 

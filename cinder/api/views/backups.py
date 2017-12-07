@@ -57,6 +57,23 @@ class ViewBuilder(common.ViewBuilder):
             },
         }
 
+    def upload_summary(self, request, upload):
+        """Generic, non-detailed view of a restore."""
+        retval = {
+            'backup_id': upload['id'],
+            'updated_at': upload['updated_at'],
+            'status': upload['status'],
+            'display_description': upload['display_description'],
+            'size': upload['size'],
+            'image_id': upload['image_id'],
+            'container_format': upload['container_format'],
+            'disk_format': upload['disk_format'],
+            'image_name': upload['image_name']
+        }
+        return {
+            'upload': retval
+        }
+
     def detail(self, request, backup):
         """Detailed view of a single backup."""
         return {

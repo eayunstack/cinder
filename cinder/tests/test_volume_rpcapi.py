@@ -283,7 +283,8 @@ class VolumeRpcAPITestCase(test.TestCase):
                               new_type_id='fake',
                               dest_host=dest_host,
                               migration_policy='never',
-                              reservations=None,
+                              reservations=self.fake_reservations,
+                              old_reservations=self.fake_reservations,
                               version='1.12')
 
     def test_manage_existing(self):

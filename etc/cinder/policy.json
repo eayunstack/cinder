@@ -16,6 +16,7 @@
     "volume:extend": "",
     "volume:update_readonly_flag": "",
     "volume:retype": "",
+    "volume:revert_to_snapshot": "rule:admin_or_owner",
 
     "volume_extension:types_manage": "rule:admin_api",
     "volume_extension:types_extra_specs": "rule:admin_api",

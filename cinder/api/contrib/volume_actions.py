@@ -26,6 +26,7 @@ from cinder.openstack.common import strutils
 from cinder import utils
 from cinder import volume
 
+import six
 
 LOG = logging.getLogger(__name__)
 
@@ -366,6 +367,50 @@ class VolumeActionsController(wsgi.Controller):
 
         self.volume_api.update(context, volume, update_dict)
         return webob.Response(status_int=200)
+
+    @wsgi.action('os-revert')
+    def _revert(self, req, id, body):
+        """revert a volume to a snapshot"""
+
+        context = req.environ['cinder.context']
+
+        if not self.is_valid_body(body, 'os-revert'):
+            raise webob.exc.HTTPBadRequest(
+                explanation=_("Missing required element os_revert in "
+                              "request body."))
+        params = body['os-revert']
+        snapshot_id = params.get("snapshot_id", None)
+        if not snapshot_id:
+            msg = _("No snapshot id was specified in request.")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        try:
+            volume = self.volume_api.get(context, id)
+        except exception.VolumeNotFound as error:
+            raise webob.exc.HTTPNotFound(explanation=error.msg)
+        try:
+            snapshot = self.volume_api.get_snapshot(context, snapshot_id)
+        except exception.NotFound:
+            msg = _("Snapshot could not be found")
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        # Ensure volume and snapshot match.
+        if snapshot['volume_id'] != id:
+            msg = _("Snapshot %(s_id)s was not created from "
+                    "the volume %(v_id)s.")
+            raise webob.exc.HTTPBadRequest(
+                explanation=msg % {'s_id': snapshot_id, 'v_id': id})
+
+        msg = 'Reverting volume %(v_id)s to snapshot %(s_id)s.'
+        LOG.info(msg, {'v_id': id,
+                       's_id': snapshot_id})
+        try:
+            self.volume_api.revert_to_snapshot(context, volume, snapshot)
+        except (exception.InvalidVolume, exception.InvalidSnapshot) as e:
+            raise webob.exc.HTTPConflict(explanation=six.text_type(e))
+        except exception.VolumeSizeExceedsAvailableQuota as e:
+            raise webob.exc.HTTPForbidden(explanation=six.text_type(e))
+        return webob.Response(status_int=202)
 
 
 class Volume_actions(extensions.ExtensionDescriptor):

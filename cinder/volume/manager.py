@@ -67,6 +67,8 @@ from cinder.volume import volume_types
 
 from eventlet.greenpool import GreenPool
 
+import six
+
 LOG = logging.getLogger(__name__)
 
 QUOTAS = quota.QUOTAS
@@ -514,6 +516,140 @@ class VolumeManager(manager.SchedulerDependentManager):
 
         return True
 
+    def _revert_to_snapshot(self, context, volume, snapshot):
+        """Use driver rollback volume."""
+
+        self._notify_about_volume_usage(context, volume, "revert.start")
+        self._notify_about_snapshot_usage(context, snapshot, "revert.start")
+        try:
+            self.driver.revert_to_snapshot(context, volume, snapshot)
+        except (NotImplementedError, AttributeError):
+            LOG.info("Driver's 'revert_to_snapshot' is not found. "
+                     "Try to use copy-snapshot-to-volume method.")
+            raise
+        self._notify_about_volume_usage(context, volume, "revert.end")
+        self._notify_about_snapshot_usage(context, snapshot, "revert.end")
+
+    def _create_backup_snapshot(self, context, volume):
+        name = '[revert] volume %s backup snapshot' % volume['id']
+        description = str('This is only used for backup when '
+                          'reverting. If the reverting process '
+                          'failed, you can restore you data by '
+                          'creating new volume with this snapshot.')
+        options = {'volume_id': volume['id'],
+                   'cgsnapshot_id': None,
+                   'user_id': context.user_id,
+                   'project_id': context.project_id,
+                   'status': "creating",
+                   'progress': '0%',
+                   'volume_size': volume['size'],
+                   'display_name': name,
+                   'display_description': description,
+                   'volume_type_id': volume['volume_type_id'],
+                   'encryption_key_id': volume['encryption_key_id'],
+                   'metadata': {}}
+
+        snapshot = self.db.snapshot_create(context, options)
+        self.create_snapshot(context, volume['id'], snapshot['id'])
+
+        return snapshot
+
+    def revert_to_snapshot(self, context, volume, snapshot):
+        """Revert a volume to a snapshot.
+
+        The process of reverting to snapshot consists of several steps:
+        1.   create a snapshot for backup (in case of data loss)
+        2.1. use driver's specific logic to revert volume
+        3.   delete the backup snapshot
+        """
+        backup_snapshot = None
+
+        # check the volume status before revert
+        volume_ref_now = self.db.volume_get(context, volume['id'])
+        actual_status = volume_ref_now['status']
+        if actual_status != 'reverting':
+            err = (_('Revert volume aborted, expected volume status '
+                     '%(expected_status)s but got %(actual_status)s.') %
+                   {'expected_status': 'reverting',
+                    'actual_status': actual_status})
+            self.db.volume_update(context, volume['id'],
+                                  {'status': 'error_reverting'})
+            self.db.snapshot_update(context, snapshot['id'],
+                                    {'status': 'available'})
+            raise exception.InvalidVolume(reason=err)
+
+        # check the snapshot status
+        snapshot_ref_now = self.db.snapshot_get(context, snapshot['id'])
+        actual_status = snapshot_ref_now['status']
+        if actual_status != 'restoring':
+            err = (_('Restore snapshot aborted, expected snapshot status '
+                     '%(expected_status)s but got %(actual_status)s.') %
+                   {'expected_status': 'restoring',
+                    'actual_status': actual_status})
+            self.db.volume_update(context, volume['id'],
+                                  {'status': 'error_reverting'})
+            self.db.snapshot_update(context, snapshot['id'],
+                                    {'status': 'error_restoring'})
+            raise exception.InvalidSnapshot(reason=err)
+
+        # if the backend driver do not support reverting to any snapshot,
+        # sure the snapshot is the latest one
+        if not (hasattr(self.driver, 'support_reverting_to_any_snapshot') and
+                self.driver.support_reverting_to_any_snapshot is True):
+            l_snap = self.db.snapshot_get_latest_for_volume(context,
+                                                                 volume['id'])
+            if l_snap.id != snapshot['id']:
+                err = (_('Revert volume aborted, the backend only '
+                         'support reverting from the latest snapshot, '
+                         'but got %(snap_id)s.') %
+                       {'snap_id': snapshot['id']})
+                self.db.snapshot_update(context, snapshot['id'],
+                                        {'status': 'available'})
+                self.db.volume_update(context, volume['id'],
+                                      {'status': 'error_reverting'})
+                raise exception.InvalidSnapshot(reason=err)
+
+        LOG.info("Start to perform revert to snapshot process.")
+
+        # Create a snapshot which can be used to restore the volume
+        # data by hand if revert process failed
+        try:
+            backup_snapshot = self._create_backup_snapshot(context, volume)
+            self._revert_to_snapshot(context, volume_ref_now, snapshot_ref_now)
+        except Exception as error:
+            with excutils.save_and_reraise_exception():
+                self._notify_about_volume_usage(context, volume_ref_now,
+                                                "revert.end")
+                self._notify_about_snapshot_usage(context, snapshot_ref_now,
+                                                  "revert.end")
+                msg = ('Volume %(v_id)s revert to '
+                       'snapshot %(s_id)s failed with %(error)s.')
+                msg_args = {'v_id': volume['id'],
+                            's_id': snapshot['id'],
+                            'error': six.text_type(error)}
+                LOG.exception(msg, msg_args)
+                self.db.volume_update(context, volume['id'],
+                                      {'status': 'error_reverting'})
+                self.db.snapshot_update(context, snapshot['id'],
+                                        {'status': 'available'})
+
+        self._notify_about_volume_usage(context, volume_ref_now,
+                                        "revert.end")
+        self._notify_about_snapshot_usage(context, snapshot_ref_now,
+                                          "revert.end")
+        self.db.volume_update(context, volume['id'],
+                              {'status': 'available'})
+        self.db.snapshot_update(context, snapshot['id'],
+                                {'status': 'available'})
+
+        if backup_snapshot:
+            self.delete_snapshot(context, backup_snapshot['id'],
+                                 handle_quota=False)
+        msg = ('Volume %(v_id)s reverted to snapshot %(snap_id)s '
+               'successfully.')
+        msg_args = {'v_id': volume['id'], 'snap_id': snapshot['id']}
+        LOG.info(msg, msg_args)
+
     def create_snapshot(self, context, volume_id, snapshot_id):
         """Creates and exports the snapshot."""
         caller_context = context
@@ -574,7 +710,7 @@ class VolumeManager(manager.SchedulerDependentManager):
         return snapshot_id
 
     @locked_snapshot_operation
-    def delete_snapshot(self, context, snapshot_id):
+    def delete_snapshot(self, context, snapshot_id, handle_quota=True):
         """Deletes and unexports snapshot."""
         caller_context = context
         context = context.elevated()
@@ -612,21 +748,24 @@ class VolumeManager(manager.SchedulerDependentManager):
                                         {'status': 'error_deleting'})
 
         # Get reservations
+        reservations = None
         try:
-            if CONF.no_snapshot_gb_quota:
-                reserve_opts = {'snapshots': -1}
-            else:
-                reserve_opts = {
-                    'snapshots': -1,
-                    'gigabytes': -snapshot_ref['volume_size'],
-                }
-            volume_ref = self.db.volume_get(context, snapshot_ref['volume_id'])
-            QUOTAS.add_volume_type_opts(context,
-                                        reserve_opts,
-                                        volume_ref.get('volume_type_id'))
-            reservations = QUOTAS.reserve(context,
-                                          project_id=project_id,
-                                          **reserve_opts)
+            if handle_quota:
+                if CONF.no_snapshot_gb_quota:
+                    reserve_opts = {'snapshots': -1}
+                else:
+                    reserve_opts = {
+                        'snapshots': -1,
+                        'gigabytes': -snapshot_ref['volume_size'],
+                    }
+                volume_ref = self.db.volume_get(context,
+                                                snapshot_ref['volume_id'])
+                QUOTAS.add_volume_type_opts(context,
+                                            reserve_opts,
+                                            volume_ref.get('volume_type_id'))
+                reservations = QUOTAS.reserve(context,
+                                              project_id=project_id,
+                                              **reserve_opts)
         except Exception:
             reservations = None
             LOG.exception(_("Failed to update usages deleting snapshot"))
@@ -1345,7 +1484,8 @@ class VolumeManager(manager.SchedulerDependentManager):
             extra_usage_info={'size': int(new_size)})
 
     def retype(self, ctxt, volume_id, new_type_id, host,
-               migration_policy='never', reservations=None):
+               migration_policy='never', reservations=None,
+               old_reservations=None):
 
         def _retype_error(context, volume_id, old_reservations,
                           new_reservations, status_update):
@@ -1377,21 +1517,33 @@ class VolumeManager(manager.SchedulerDependentManager):
                 # for now.
                 self.db.volume_update(context, volume_id, status_update)
 
-        # Get old reservations
-        try:
-            reserve_opts = {'volumes': -1, 'gigabytes': -volume_ref['size']}
-            QUOTAS.add_volume_type_opts(context,
-                                        reserve_opts,
-                                        volume_ref.get('volume_type_id'))
-            old_reservations = QUOTAS.reserve(context,
-                                              project_id=project_id,
-                                              **reserve_opts)
-        except Exception:
-            old_reservations = None
-            self.db.volume_update(context, volume_id, status_update)
-            LOG.exception(_("Failed to update usages while retyping volume."))
-            raise exception.CinderException(_("Failed to get old volume type"
-                                              " quota reservations"))
+        # If old_reservations has been passed in from the API, we should
+        # skip quotas.
+        # TODO(ntpttr): These reservation checks are left in to be backwards
+        #               compatible with Liberty and can be removed in N.
+        if not old_reservations:
+            # Get old reservations
+            try:
+                reserve_opts = {'volumes': -1,
+                                'gigabytes': -volume_ref['size']}
+                QUOTAS.add_volume_type_opts(context,
+                                            reserve_opts,
+                                            volume_ref.get('volume_type_id'))
+                # NOTE(wanghao): We don't need to reserve volumes and gigabytes
+                # quota for retyping operation since they didn't changed, just
+                # reserve volume_type and type gigabytes is fine.
+                reserve_opts.pop('volumes')
+                reserve_opts.pop('gigabytes')
+                old_reservations = QUOTAS.reserve(context,
+                                                  project_id=project_id,
+                                                  **reserve_opts)
+            except Exception:
+                old_reservations = None
+                self.db.volume_update(context, volume_id, status_update)
+                LOG.exception(_("Failed to update usages while retyping"
+                                " volume."))
+                raise exception.CinderException(_("Failed to get old volume"
+                                                  " type quota reservations"))
 
         # We already got the new reservations
         new_reservations = reservations

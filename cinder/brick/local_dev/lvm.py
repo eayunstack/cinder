@@ -516,6 +516,21 @@ class LVM(executor.Executor):
             return name
         return '_' + name
 
+    def deactivate_lv(self, name):
+        lv_path = self.vg_name + '/' + self._mangle_lv_name(name)
+        cmd = ['lvchange', '-a', 'n']
+        cmd.append(lv_path)
+        try:
+            self._execute(*cmd,
+                          root_helper=self._root_helper,
+                          run_as_root=True)
+        except putils.ProcessExecutionError as err:
+            LOG.exception(_('Error deactivating LV'))
+            LOG.error(_('Cmd     :%s'), err.cmd)
+            LOG.error(_('StdOut  :%s'), err.stdout)
+            LOG.error(_('StdErr  :%s'), err.stderr)
+            raise
+
     def activate_lv(self, name, is_snapshot=False):
         """Ensure that logical volume/snapshot logical volume is activated.
 
@@ -598,14 +613,21 @@ class LVM(executor.Executor):
                 root_helper=self._root_helper, run_as_root=True)
 
     def revert(self, snapshot_name):
-        """Revert an LV from snapshot.
+        """Revert an LV to snapshot.
 
         :param snapshot_name: Name of snapshot to revert
-
         """
-        self._execute('lvconvert', '--merge',
-                      snapshot_name, root_helper=self._root_helper,
-                      run_as_root=True)
+
+        cmd = ['lvconvert', '--merge', '%s/%s' % (self.vg_name, snapshot_name)]
+        try:
+            self._execute(*cmd, root_helper=self._root_helper,
+                          run_as_root=True)
+        except putils.ProcessExecutionError as err:
+            LOG.exception('Error Revert Volume')
+            LOG.error('Cmd     :%s', err.cmd)
+            LOG.error('StdOut  :%s', err.stdout)
+            LOG.error('StdErr  :%s', err.stderr)
+            raise
 
     def lv_has_snapshot(self, name):
         out, err = self._execute(
@@ -620,7 +642,12 @@ class LVM(executor.Executor):
 
     def extend_volume(self, lv_name, new_size):
         """Extend the size of an existing volume."""
-
+        # Volumes with snaps have attributes 'o' or 'O' and will be
+        # deactivated, but Thin Volumes with snaps have attribute 'V'
+        # and won't be deactivated because the lv_has_snapshot method looks
+        # for 'o' or 'O'
+        if self.lv_has_snapshot(lv_name):
+            self.deactivate_lv(lv_name)
         try:
             self._execute('lvextend', '-L', new_size,
                           '%s/%s' % (self.vg_name, lv_name),
